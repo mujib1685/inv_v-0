@@ -1,0 +1,213 @@
+import sqlite3
+import tkinter as tk
+from tkinter import messagebox, simpledialog, ttk
+from datetime import datetime
+import win32print
+import win32api
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+
+def create_tables():
+    conn = sqlite3.connect("inventory.db")
+    cursor = conn.cursor()
+    
+    cursor.execute('''CREATE TABLE IF NOT EXISTS assets (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        category TEXT,
+                        assigned_qty INTEGER DEFAULT 0,
+                        assignee TEXT,
+                        remark TEXT,
+                        available_qty INTEGER DEFAULT 0,
+                        available_stock INTEGER DEFAULT 0)''')
+
+    cursor.execute('''CREATE TABLE IF NOT EXISTS stock_entries (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        asset_id INTEGER,
+                        transaction_type TEXT,
+                        quantity INTEGER,
+                        assignee TEXT,
+                        date TEXT,
+                        FOREIGN KEY(asset_id) REFERENCES assets(id))''')
+    
+    conn.commit()
+    conn.close()
+
+def add_asset(name, category, available_qty):
+    conn = sqlite3.connect("inventory.db")
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO assets (name, category, available_qty, available_stock) VALUES (?, ?, ?, ?)", 
+                   (name, category, available_qty, available_qty))
+    conn.commit()
+    conn.close()
+    messagebox.showinfo("Success", "Asset added successfully!")
+    refresh_assets()
+
+def assign_asset(asset_id, assigned_to, quantity):
+    conn = sqlite3.connect("inventory.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT available_stock FROM assets WHERE id = ?", (asset_id,))
+    asset = cursor.fetchone()
+
+    if asset and asset[0] >= quantity:
+        cursor.execute("UPDATE assets SET assigned_qty = assigned_qty + ?, available_stock = available_stock - ?, assignee = ? WHERE id = ?", 
+                       (quantity, quantity, assigned_to, asset_id))
+        cursor.execute("INSERT INTO stock_entries (asset_id, transaction_type, quantity, assignee, date) VALUES (?, 'OUT', ?, ?, ?)", 
+                       (asset_id, quantity, assigned_to, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+        conn.commit()
+        messagebox.showinfo("Success", "Asset assigned successfully!")
+    else:
+        messagebox.showerror("Error", "Not enough stock available!")
+    conn.close()
+    refresh_assets()
+
+def return_asset(asset_id, quantity):
+    conn = sqlite3.connect("inventory.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT assigned_qty FROM assets WHERE id = ?", (asset_id,))
+    asset = cursor.fetchone()
+    
+    if asset and asset[0] >= quantity:
+        cursor.execute("UPDATE assets SET assigned_qty = assigned_qty - ?, available_stock = available_stock + ? WHERE id = ?", 
+                       (quantity, quantity, asset_id))
+        cursor.execute("INSERT INTO stock_entries (asset_id, transaction_type, quantity, date) VALUES (?, 'IN', ?, ?)", 
+                       (asset_id, quantity, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+        conn.commit()
+        messagebox.showinfo("Success", "Asset returned successfully!")
+    else:
+        messagebox.showerror("Error", "Invalid return quantity!")
+    conn.close()
+    refresh_assets()
+
+def view_stock_entries():
+    top = tk.Toplevel()
+    top.title("Stock Entries")
+    tree = ttk.Treeview(top, columns=("Asset ID", "Type", "Quantity", "Assignee", "Date"), show="headings")
+    for col in ["Asset ID", "Type", "Quantity", "Assignee", "Date"]:
+        tree.heading(col, text=col)
+        tree.column(col, width=120, anchor="center")
+    tree.pack()
+    conn = sqlite3.connect("inventory.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM stock_entries ORDER BY date DESC")
+    entries = cursor.fetchall()
+    conn.close()
+    for entry in entries:
+        tree.insert("", "end", values=entry[1:])
+
+def refresh_assets():
+    for row in tree.get_children():
+        tree.delete(row)
+    conn = sqlite3.connect("inventory.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM assets")
+    assets = cursor.fetchall()
+    conn.close()
+    for asset in assets:
+        tree.insert("", "end", values=asset)
+
+def generate_pdf_challan():
+    assignee = simpledialog.askstring("Input", "Enter assignee name:")
+    if not assignee:
+        return
+
+    conn = sqlite3.connect("inventory.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT a.name, a.category, s.quantity, s.date
+        FROM stock_entries s
+        JOIN assets a ON s.asset_id = a.id
+        WHERE s.assignee = ? AND s.transaction_type = 'OUT'
+        ORDER BY s.date ASC
+    """, (assignee,))
+    assets = cursor.fetchall()
+    conn.close()
+
+    if not assets:
+        messagebox.showerror("Error", "No assets assigned to this person.")
+        return
+
+    pdf_filename = f"Challan_{assignee.replace(' ', '_')}.pdf"
+    pdf_path = f"./{pdf_filename}"
+    
+    c = canvas.Canvas(pdf_path, pagesize=A4)
+    c.setFont("Helvetica-Bold", 16)
+    
+    # Header Section
+    c.drawCentredString(300, 770, "DELIVERY CHALLAN")
+    c.setFont("Helvetica", 12)
+    c.drawString(50, 750, f"Party Name: {assignee}")
+    c.drawString(400, 750, f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    c.line(50, 740, 550, 740)  # Horizontal line
+    
+    # Column Titles
+    y_position = 710
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(50, y_position, "Instrument")
+    c.drawString(230, y_position, "Category")
+    c.drawString(370, y_position, "Quantity")
+    c.drawString(450, y_position, "Date Assigned")
+    c.line(50, y_position - 5, 550, y_position - 5)
+
+    # Table Content
+    c.setFont("Helvetica", 11)
+    y_position -= 20
+    for asset in assets:
+        c.drawString(50, y_position, asset[0])  # Name
+        c.drawString(230, y_position, asset[1])  # Category
+        c.drawString(370, y_position, str(asset[2]))  # Quantity
+        c.drawString(450, y_position, asset[3])  # Date
+        y_position -= 18  # Space between rows
+
+        if y_position < 100:  # New page if table reaches the bottom
+            c.showPage()
+            c.setFont("Helvetica", 12)
+            y_position = 750
+
+    # Footer Section
+    c.line(50, y_position - 20, 550, y_position - 20)
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(50, y_position - 40, "Approved By:")
+    c.drawString(300, y_position - 40, "Received By:")
+    c.line(50, y_position - 60, 200, y_position - 60)  # Signature line
+    c.line(275, y_position - 60, 425, y_position - 60)  # Signature line
+
+    c.save()
+    messagebox.showinfo("Success", f"PDF generated: {pdf_filename}")
+
+
+
+def main():
+    global tree
+    create_tables()
+    root = tk.Tk()
+    root.title("Inventory Management System")
+    frame = tk.Frame(root)
+    frame.pack(pady=10)
+    columns = ("Sr.", "Asset", "Asset Type", "Available Qty", "Assign Qty", "Available Stock", "Assignee", "Remark")
+    tree = ttk.Treeview(frame, columns=columns, show="headings")
+    for col in columns:
+        tree.heading(col, text=col)
+        tree.column(col, width=120, anchor="center")
+    tree.pack()
+    refresh_assets()
+    btn_frame = tk.Frame(root)
+    btn_frame.pack(pady=10)
+    tk.Button(btn_frame, text="Add Asset", command=lambda: add_asset(
+        simpledialog.askstring("Input", "Enter asset name:"),
+        simpledialog.askstring("Input", "Enter asset category:"),
+        int(simpledialog.askinteger("Input", "Enter available quantity:")))).pack(side=tk.LEFT, padx=5)
+    tk.Button(btn_frame, text="Assign Asset", command=lambda: assign_asset(
+        int(simpledialog.askinteger("Input", "Enter asset ID:")),
+        simpledialog.askstring("Input", "Enter assignee name:"),
+        int(simpledialog.askinteger("Input", "Enter quantity to assign:")))).pack(side=tk.LEFT, padx=5)
+    tk.Button(btn_frame, text="Return Asset", command=lambda: return_asset(
+        int(simpledialog.askinteger("Input", "Enter asset ID:")),
+        int(simpledialog.askinteger("Input", "Enter quantity to return:")))).pack(side=tk.LEFT, padx=5)
+    tk.Button(btn_frame, text="Generate PDF Challan", command=generate_pdf_challan).pack(side=tk.LEFT, padx=5)
+    tk.Button(btn_frame, text="View Stock Entries", command=view_stock_entries).pack(side=tk.LEFT, padx=5)
+    tk.Button(btn_frame, text="Exit", command=root.quit).pack(side=tk.LEFT, padx=5)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
